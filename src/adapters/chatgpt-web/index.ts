@@ -7,6 +7,11 @@ import { parseDataUrl } from "../image";
 import { ChatGptWebAdapterError } from "./adapter-error";
 import { ChatGptBrowserWorker } from "./browser-worker";
 import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity } from "./environment";
+import {
+  chatGptEmulatedToolResultRevision,
+  chatGptUsesEmulatedTools,
+  parseChatGptEmulatedToolResponse,
+} from "./emulated-tools";
 import { CHATGPT_WEB_LUNA_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt } from "./prompt";
 import { TurnBroker, type BrokerToolRequest, type BrokerToolResult } from "./turn-broker";
@@ -193,6 +198,8 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
     turnCapabilities: ChatGptWebCapabilities,
   ): ChatGptTurnRuntime => {
     const mode = resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, turnCapabilities);
+    const emulatedTools = chatGptUsesEmulatedTools(parsed, mode);
+    const emulatedToolNonce = emulatedTools ? `relay_${traceId}` : undefined;
     const identity = extractChatGptTurnIdentity(parsed);
     const captureLunaCheckpoint = parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID
       && !parsed._compactionRequest
@@ -235,14 +242,20 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
             checkpointInput.parsed,
             turnCapabilities,
             undefined,
-            { captureLunaCheckpoint },
+            {
+              captureLunaCheckpoint,
+              ...(emulatedToolNonce ? { emulatedToolNonce } : {}),
+            },
           ),
           release: () => {},
         }),
         abortSignal: browserAbort.signal,
         onReasoningSummary: (text, continuation) => trace.push({ kind: "reasoning", text, ...(continuation ? { continuation: true } : {}) }),
         onCommentary: (text, continuation) => trace.push({ kind: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
-        onTextDelta: delta => text.push(delta),
+        // Pro relay output is buffered until the completed response can be authenticated as either
+        // a strict control block or a normal final answer. This prevents control JSON leaking into
+        // the Codex transcript while the browser DOM is still streaming.
+        onTextDelta: delta => { if (!emulatedTools) text.push(delta); },
         ...(captureLunaCheckpoint ? {
           captureLunaCheckpoint: true,
           onLunaCheckpoint: captureCheckpoint,
@@ -329,6 +342,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
         ? { ...configuredCapabilities, localToolsEnabled: false }
         : configuredCapabilities;
       const mode = resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, turnCapabilities);
+      const emulatedTools = chatGptUsesEmulatedTools(parsed, mode);
       let environment: ReturnType<typeof extractChatGptTurnEnvironment> | undefined;
       if (mode.localTools) {
         try {
@@ -345,9 +359,16 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
         const responseExecutionKey = `${executionNamespace}:${chatGptCompactionSourceExecutionKey(parsed)}`;
         await chatGptTurnSessions.retireAndWait(responseExecutionKey);
       }
-      const executionKey = `${executionNamespace}:${chatGptTurnExecutionKey(parsed)}`;
+      const baseExecutionKey = chatGptTurnExecutionKey(parsed);
+      const roundExecutionKey = emulatedTools
+        ? createHash("sha256")
+          .update(`${baseExecutionKey}\0${chatGptEmulatedToolResultRevision(parsed)}`)
+          .digest("hex")
+        : baseExecutionKey;
+      const executionKey = `${executionNamespace}:${roundExecutionKey}`;
       await chatGptTurnSessions.waitForRetirement(executionKey);
       const traceId = createHash("sha256").update(executionKey).digest("hex").slice(0, 12);
+      const emulatedToolNonce = `relay_${traceId}`;
       const session = chatGptTurnSessions.getOrCreate(
         executionKey,
         () => startRuntime(parsed, environment, traceId, turnCapabilities),
@@ -359,6 +380,17 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
           const settled = session.settledOutcome();
           if (settled) {
             if (settled.type === "error") throw settled.error;
+            if (emulatedTools && session.outstanding().length > 0) {
+              const outstanding = session.outstanding();
+              const reasoning = session.reasoningForOutstandingReplay();
+              replayEvents(session.eventsForOutstandingReplay(), emit);
+              emitToolBatch(
+                outstanding,
+                estimateChatGptWebUsage(currentUsageInput(parsed), { reasoning, toolRequests: outstanding }, turnCapabilities),
+                emit,
+              );
+              return;
+            }
             let reasoning = session.reasoningForFinalReplay();
             const replay = session.eventsForFinalReplay();
             if (replay.length > 0) {
@@ -369,13 +401,28 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
                 events.push(event);
                 emit(event);
               };
-              if (!parsed._compactionRequest) emitProContextWarning(parsed, turnCapabilities, emitCaptured);
+              if (!parsed._compactionRequest && !emulatedTools) emitProContextWarning(parsed, turnCapabilities, emitCaptured);
               const trace = session.runtime.trace.drain();
               reasoning = trace.map(event => event.text);
               emitTraceEvents(trace, emitCaptured);
-              emitTextDeltas(session.runtime.text.drain(), emitCaptured);
-              if (session.runtime.text.value() !== settled.answer) {
-                throw new Error("ChatGPT browser Markdown stream did not reproduce the completed answer");
+              if (emulatedTools) {
+                const requests = parseChatGptEmulatedToolResponse(settled.answer, parsed, emulatedToolNonce);
+                if (requests) {
+                  validateBatchTools(parsed, requests);
+                  session.setOutstanding(requests, reasoning, events);
+                  emitToolBatch(
+                    requests,
+                    estimateChatGptWebUsage(currentUsageInput(parsed), { reasoning, toolRequests: requests }, turnCapabilities),
+                    emit,
+                  );
+                  return;
+                }
+                emitTextDeltas([settled.answer], emitCaptured);
+              } else {
+                emitTextDeltas(session.runtime.text.drain(), emitCaptured);
+                if (session.runtime.text.value() !== settled.answer) {
+                  throw new Error("ChatGPT browser Markdown stream did not reproduce the completed answer");
+                }
               }
               session.setFinalReasoning(reasoning);
               session.setFinalEvents(events);
@@ -407,7 +454,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
                 session.markResultDelivered(message.toolCallId);
               }
             }
-          } else if (session.outstanding().length > 0) {
+          } else if (!emulatedTools && session.outstanding().length > 0) {
             throw new Error("Read-only ChatGPT Web runtime cannot own local tool calls");
           }
 
@@ -424,7 +471,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
               emitTraceEvents(trace, emitRound);
             };
             const emitNewText = (deltas: string[]) => emitTextDeltas(deltas, emitRound);
-            if (!parsed._compactionRequest) emitProContextWarning(parsed, turnCapabilities, emitRound);
+            if (!parsed._compactionRequest && !emulatedTools) emitProContextWarning(parsed, turnCapabilities, emitRound);
             emitNewTrace(session.runtime.trace.drain());
             emitNewText(session.runtime.text.drain());
             const nextTools = turnToken
@@ -456,10 +503,32 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
               emitNewTrace(session.runtime.trace.drain());
               emitNewText(session.runtime.text.drain());
               if (next.type === "browser") {
-                session.setFinalReasoning(roundReasoning);
-                session.setFinalEvents(roundEvents);
                 if (turnToken) broker.revoke(turnToken);
                 if (next.outcome.type === "error") throw next.outcome.error;
+                if (emulatedTools) {
+                  const requests = parseChatGptEmulatedToolResponse(next.outcome.answer, parsed, emulatedToolNonce);
+                  if (requests) {
+                    validateBatchTools(parsed, requests);
+                    session.setOutstanding(requests, roundReasoning, roundEvents);
+                    emitToolBatch(
+                      requests,
+                      estimateChatGptWebUsage(currentUsageInput(parsed), { reasoning: roundReasoning, toolRequests: requests }, turnCapabilities),
+                      emit,
+                    );
+                    return;
+                  }
+                  emitNewText([next.outcome.answer]);
+                  session.setFinalReasoning(roundReasoning);
+                  session.setFinalEvents(roundEvents);
+                  emitBrowserCompletion(
+                    next.outcome,
+                    estimateChatGptWebUsage(currentUsageInput(parsed), { answer: next.outcome.answer, reasoning: roundReasoning }, turnCapabilities),
+                    emit,
+                  );
+                  return;
+                }
+                session.setFinalReasoning(roundReasoning);
+                session.setFinalEvents(roundEvents);
                 if (session.runtime.text.value() !== next.outcome.answer) {
                   throw new Error("ChatGPT browser Markdown stream did not reproduce the completed answer");
                 }

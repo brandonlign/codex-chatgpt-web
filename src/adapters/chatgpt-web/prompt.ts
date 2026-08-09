@@ -5,6 +5,7 @@ import {
   CHATGPT_LUNA_CHECKPOINT_MARKER,
   CHATGPT_LUNA_CHECKPOINT_MAX_TOKENS,
 } from "./rolling-checkpoint";
+import { buildChatGptEmulatedToolContract } from "./emulated-tools";
 
 export interface ChatGptWebPromptImage {
   ref: string;
@@ -21,6 +22,8 @@ export interface CompiledChatGptWebPrompt {
 
 export interface CompileChatGptWebPromptOptions {
   captureLunaCheckpoint?: boolean;
+  /** Prompt-based Codex tool relay used by ChatGPT Pro, which cannot attach the custom MCP app. */
+  emulatedToolNonce?: string;
 }
 
 const RETIRED_TURN_HANDLE = /\b(turn|binding)_[A-Za-z0-9_-]{24,}/g;
@@ -199,6 +202,10 @@ export function compileChatGptWebPrompt(
 ): CompiledChatGptWebPrompt {
   const mode = resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, capabilities);
   const captureLunaCheckpoint = options?.captureLunaCheckpoint === true;
+  const emulatedToolContract = options?.emulatedToolNonce
+    ? buildChatGptEmulatedToolContract(parsed, options.emulatedToolNonce)
+    : [];
+  const emulatedTools = emulatedToolContract.length > 0;
   if (parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID && parsed._compactionRequest) {
     throw new Error("ChatGPT Luna uses rolling checkpoints and does not accept a separate compaction turn");
   }
@@ -236,6 +243,8 @@ export function compileChatGptWebPrompt(
       "For local work required by the task, use the attached Codex Native tools directly according to their declared descriptions and schemas.",
       "Use actual Codex Native results as evidence for local observations and effects, and keep calling tools until the requested work is complete and verified.",
     ]
+    : emulatedTools
+    ? emulatedToolContract
     : [
       `This is ChatGPT Web ${mode.displayLabel} with no Codex Native bridge to the user's local computer attached to this response. This restriction applies only to local Codex files, commands, processes, and computer mutations.`,
       "Use any ChatGPT-native capabilities available in this chat—including web search, browsing, research, and other first-party tools—whenever they help complete the request. The missing local-computer bridge says nothing about whether those ChatGPT capabilities are available.",
@@ -265,6 +274,12 @@ export function compileChatGptWebPrompt(
       `The task context is complete. Pass turn_token ${turnToken} unchanged to every Codex Native call in this response, including continuations after tool results; do not expose it in the answer. Execute the latest active user request now.`,
       "</codex_transport_resume>",
     ]
+    : emulatedTools
+    ? [
+      "<codex_transport_resume>",
+      "The task context is complete. Execute the latest active user request now. Use the outer Codex relay control block only when local tool work is needed; otherwise return the normal final answer.",
+      "</codex_transport_resume>",
+    ]
     : [
       "<codex_transport_resume>",
       "The task context is complete. Execute the latest active user request now under the capability contract above.",
@@ -284,7 +299,9 @@ export function compileChatGptWebPrompt(
       ...checkpointContract,
       captureLunaCheckpoint
         ? "Return the complete answer that the outer Codex task should receive, then the required private checkpoint tail."
-        : "Return only the answer that the outer Codex task should receive.",
+        : emulatedTools
+          ? "Return either the normal answer that the outer Codex task should receive or exactly one emulated-tool control block as specified above."
+          : "Return only the answer that the outer Codex task should receive.",
       "<codex_context_json>",
       envelopeJson,
       "</codex_context_json>",
