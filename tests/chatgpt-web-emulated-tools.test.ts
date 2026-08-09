@@ -66,6 +66,10 @@ function proRequest(): CodexParsedRequest {
   };
 }
 
+function relayBlock(nonce: string, payload: unknown): string {
+  return `[[CODEX_TOOL_RELAY_BEGIN_${nonce}]]\n${JSON.stringify(payload)}\n[[CODEX_TOOL_RELAY_END_${nonce}]]`;
+}
+
 const capabilities = { localToolsEnabled: false, solAvailable: true, proAvailable: true };
 
 describe("ChatGPT Pro emulated Codex tools", () => {
@@ -73,7 +77,8 @@ describe("ChatGPT Pro emulated Codex tools", () => {
     const request = proRequest();
     const lines = buildChatGptEmulatedToolContract(request, "relay_123456789abc");
     const text = lines.join("\n");
-    expect(text).toContain('<codex_tool_calls nonce="relay_123456789abc">');
+    expect(text).toContain("[[CODEX_TOOL_RELAY_BEGIN_relay_123456789abc]]");
+    expect(text).toContain("[[CODEX_TOOL_RELAY_END_relay_123456789abc]]");
     expect(text).toContain('"name":"exec_command"');
     expect(text).toContain('"name":"apply_patch"');
     expect(text).toContain('"name":"mcp__docs__search_docs"');
@@ -93,12 +98,12 @@ describe("ChatGPT Pro emulated Codex tools", () => {
     const request = proRequest();
     const nonce = "relay_123456789abc";
     const parsed = parseChatGptEmulatedToolResponse(
-      `<codex_tool_calls nonce="${nonce}">\n${JSON.stringify({
+      relayBlock(nonce, {
         calls: [
           { name: "exec_command", arguments: { cmd: "pwd" } },
           { name: "apply_patch", input: "*** Begin Patch\n*** End Patch" },
         ],
-      })}\n</codex_tool_calls>`,
+      }),
       request,
       nonce,
     );
@@ -108,17 +113,17 @@ describe("ChatGPT Pro emulated Codex tools", () => {
     expect(parsed?.[0]?.callId).toMatch(/^call_[a-f0-9]{32}$/);
 
     expect(() => parseChatGptEmulatedToolResponse(
-      `<codex_tool_calls nonce="${nonce}">${JSON.stringify({ calls: [{ name: "exec_command", arguments: {} }] })}</codex_tool_calls>`,
+      relayBlock(nonce, { calls: [{ name: "exec_command", arguments: {} }] }),
       request,
       nonce,
     )).toThrow("arguments.cmd is required");
     expect(() => parseChatGptEmulatedToolResponse(
-      `<codex_tool_calls nonce="${nonce}">${JSON.stringify({ calls: [{ name: "not_declared", arguments: {} }] })}</codex_tool_calls>`,
+      relayBlock(nonce, { calls: [{ name: "not_declared", arguments: {} }] }),
       request,
       nonce,
     )).toThrow("undeclared or disallowed");
     expect(() => parseChatGptEmulatedToolResponse(
-      `prefix <codex_tool_calls nonce="${nonce}">${JSON.stringify({ calls: [{ name: "exec_command", arguments: { cmd: "pwd" } }] })}</codex_tool_calls>`,
+      `prefix ${relayBlock(nonce, { calls: [{ name: "exec_command", arguments: { cmd: "pwd" } }] })}`,
       request,
       nonce,
     )).toThrow("malformed or mixed");
@@ -148,12 +153,12 @@ describe("ChatGPT Pro emulated Codex tools", () => {
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
       browserStarts += 1;
       const prepared = await turn.prepare();
-      const nonce = prepared.text.match(/<codex_tool_calls nonce="([A-Za-z0-9_-]+)">/)?.[1];
+      const nonce = prepared.text.match(/\[\[CODEX_TOOL_RELAY_BEGIN_([A-Za-z0-9_-]+)\]\]/)?.[1];
       if (!nonce) throw new Error("emulated tool nonce missing from Pro prompt");
       if (browserStarts === 1) {
-        const answer = `<codex_tool_calls nonce="${nonce}">${JSON.stringify({
+        const answer = relayBlock(nonce, {
           calls: [{ name: "exec_command", arguments: { cmd: "pwd" } }],
-        })}</codex_tool_calls>`;
+        });
         // The adapter intentionally buffers this stream so the control block never reaches Codex as text.
         turn.onTextDelta(answer);
         return answer;
@@ -174,7 +179,7 @@ describe("ChatGPT Pro emulated Codex tools", () => {
         (event): event is Extract<AdapterEvent, { type: "tool_call_start" }> => event.type === "tool_call_start",
       );
       expect(start?.name).toBe("exec_command");
-      expect(firstEvents.some(event => event.type === "text_delta" && event.text.includes("codex_tool_calls"))).toBe(false);
+      expect(firstEvents.some(event => event.type === "text_delta" && event.text.includes("CODEX_TOOL_RELAY"))).toBe(false);
       expect(firstEvents.at(-1)).toMatchObject({ type: "done", stopReason: "tool_use", endTurn: false });
 
       const continuation = structuredClone(first);
